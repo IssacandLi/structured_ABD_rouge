@@ -1,0 +1,36 @@
+name: bd3lm
+backbone: dit  # dit / dimamba / hf_dit
+parameterization: subs
+time_conditioning: False
+T: 0  # 0 (continuous time) / 1000 
+causal_attention: False
+dropout: 0.0
+ignore_bos: True
+cross_attn: True
+var_min: True
+clip_search_delta: 0.05
+clip_search_widths: []
+fix_clipping: False
+sampler: semi_ar
+mdlm_loss_scale: False
+# --- Mechanism C: Structured Masking (token-level, block-agnostic) ---
+structured_masking:
+  enabled: False
+  r_low: 0.3
+  r_high: 0.7
+  b_max_tokens: 32          # 新：最大 span token 数（文档 §3.4 的 B_max）
+  global_t: True
+  full_bidir_attention: True  # 新：训练时禁用 block-causal，用全双向 mask
+
+# --- Mechanism A: Span-Level Loss ---
+span_loss:
+  enabled: False          # 设为 True 启用 Mechanism A
+  lambda_span: 1.0        # span loss 的全局缩放因子
+  type: bow               # 'bow' (Bag-of-Words) 或 'embedding'
+  
+# --- C-inf: Structured Unmasking at Inference ---
+structured_inference:
+  enabled: False          # 设为 True 启用 C-inf
+  aggregation: mean       # span confidence 聚合: mean / top_k_mean / max
+  commitment: mixed       # mixed = span-token 混合; hard = 纯 span 级
+  threshold: fixed_ratio  # fixed_ratio / adaptive

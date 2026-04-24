@@ -1,0 +1,20 @@
+# cnn_dailymail.yaml
+train: cnn_dailymail
+valid: cnn_dailymail
+tokenizer_name_or_path: gpt2
+cache_dir: /share/kuleshov/ssahoo/textdiffusion/data
+wrap: False
+streaming: False
+
+# 这些对 cnn_dm 分支不关键，但保留也行
+insert_train_eos: True
+insert_valid_eos: True
+insert_train_special: True
+insert_valid_special: True
+
+# --- NEW (可选) ---
+cnn_dm_version: "3.0.0"
+prefix_max_tokens: 768
+answer_max_tokens: 256
+loss_on_answer_eos: True
+conditional_generation: True
