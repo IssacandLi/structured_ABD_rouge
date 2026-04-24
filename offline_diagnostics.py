@@ -7,8 +7,10 @@ from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import normalize as sk_normalize
 
 
 FUNCTION_WORDS = {
@@ -31,6 +33,12 @@ FUNCTION_WORDS = {
 
 SPECIAL_TOKENS = {'<|endoftext|>', '[mask]'}
 BUCKET_LABELS = ['early', 'mid_early', 'mid_late', 'late']
+CONTENT_POS_PREFIXES = ('NN', 'VB', 'JJ')
+CONTENT_POS_TAGS = {'RB', 'RBR', 'RBS'}
+FUNCTION_POS_TAGS = {
+  'DT', 'PDT', 'WDT', 'IN', 'CC', 'TO', 'PRP', 'PRP$',
+  'WP', 'WP$', 'WRB', 'MD', 'EX', 'POS', 'RP', 'UH',
+}
 
 
 def parse_args():
@@ -50,6 +58,47 @@ def parse_args():
     choices=['gt', 'final', 'full'],
     default='gt',
     help='Which token span to use for per-position analysis.')
+  parser.add_argument(
+    '--timing_mode',
+    choices=['global_step', 'reveal_rank'],
+    default='global_step',
+    help=(
+      'How to define early/late timing for Diag2/Diag3. '
+      '"global_step" uses absolute denoising steps; '
+      '"reveal_rank" uses per-sample answer-token reveal order.'))
+  parser.add_argument(
+    '--diag1_backend',
+    choices=['auto', 'tfidf', 'lsa', 'transformer'],
+    default='auto',
+    help=(
+      'Similarity backend for Diag1. '
+      '"auto" tries a local transformer only if --diag1_encoder_model is set, '
+      'otherwise falls back to LSA.'))
+  parser.add_argument(
+    '--diag1_encoder_model',
+    default=None,
+    help='Local path or cached HF model id for transformer-based Diag1 embeddings.')
+  parser.add_argument(
+    '--diag1_svd_components',
+    type=int,
+    default=128,
+    help='Number of SVD dimensions for LSA-based Diag1 embeddings.')
+  parser.add_argument(
+    '--transformers_cache',
+    default=None,
+    help='Writable cache directory to use when loading local transformer models.')
+  parser.add_argument(
+    '--diag2_backend',
+    choices=['auto', 'wordlist', 'nltk_pos'],
+    default='auto',
+    help=(
+      'Classifier backend for Diag2. '
+      '"auto" uses NLTK POS tagging when local tagger data is available, '
+      'otherwise falls back to wordlist heuristics.'))
+  parser.add_argument(
+    '--nltk_data_dir',
+    default=None,
+    help='Optional local NLTK data directory containing the averaged perceptron tagger.')
   return parser.parse_args()
 
 
@@ -78,6 +127,13 @@ def analysis_length(record, mode):
   return generation_len or gt_len or final_len
 
 
+def normalize_word(text):
+  token = normalize_piece(text)
+  token = re.sub(r'^[^\w]+', '', token)
+  token = re.sub(r'[^\w]+$', '', token)
+  return token
+
+
 def classify_token(piece):
   token = normalize_piece(piece)
   if not token or token in SPECIAL_TOKENS:
@@ -104,6 +160,262 @@ def load_runs(run_specs):
       'records': payload.get('records', []),
     })
   return runs
+
+
+def _group_token_pieces(token_text_list):
+  groups = []
+  current = None
+  for idx, piece in enumerate(token_text_list):
+    raw = '' if piece is None else str(piece)
+    if current is None or re.match(r'^\s', raw):
+      if current is not None:
+        groups.append(current)
+      current = {
+        'positions': [idx],
+        'surface': raw,
+      }
+    else:
+      current['positions'].append(idx)
+      current['surface'] += raw
+
+  if current is not None:
+    groups.append(current)
+
+  normalized_groups = []
+  for group in groups:
+    normalized_groups.append({
+      'positions': list(group['positions']),
+      'surface': group['surface'],
+      'text': normalize_word(group['surface']),
+    })
+  return normalized_groups
+
+
+def _classify_word_wordlist(word):
+  if not word or word in SPECIAL_TOKENS:
+    return 'OTHER'
+  if not any(ch.isalpha() for ch in word):
+    return 'OTHER'
+  if word in FUNCTION_WORDS:
+    return 'FUNCTION'
+  return 'CONTENT'
+
+
+def _classify_pos_tag(tag):
+  if not tag:
+    return 'OTHER'
+  tag = str(tag)
+  if tag in FUNCTION_POS_TAGS:
+    return 'FUNCTION'
+  if tag in CONTENT_POS_TAGS or tag.startswith(CONTENT_POS_PREFIXES):
+    return 'CONTENT'
+  return 'OTHER'
+
+
+def _nltk_tagger_available(nltk_data_dir=None):
+  try:
+    import nltk
+    if nltk_data_dir:
+      nltk.data.path.insert(0, nltk_data_dir)
+    nltk.data.find('taggers/averaged_perceptron_tagger')
+    return True
+  except Exception:
+    return False
+
+
+def _resolve_diag2_backend(requested_backend, nltk_data_dir=None):
+  notes = []
+  if requested_backend == 'wordlist':
+    return 'wordlist', notes
+  if requested_backend == 'nltk_pos':
+    if _nltk_tagger_available(nltk_data_dir=nltk_data_dir):
+      return 'nltk_pos', notes
+    notes.append(
+      'Requested Diag2 backend "nltk_pos" but local averaged_perceptron_tagger '
+      'data is unavailable; falling back to wordlist heuristics.')
+    return 'wordlist', notes
+  if _nltk_tagger_available(nltk_data_dir=nltk_data_dir):
+    notes.append('Diag2 auto backend selected local NLTK POS tagging.')
+    return 'nltk_pos', notes
+  notes.append(
+    'Diag2 auto backend could not find local NLTK tagger data; '
+    'using wordlist heuristics.')
+  return 'wordlist', notes
+
+
+def _categorize_positions_wordlist(token_text_list):
+  categories = ['OTHER'] * len(token_text_list)
+  for group in _group_token_pieces(token_text_list):
+    category = _classify_word_wordlist(group['text'])
+    for position in group['positions']:
+      categories[position] = category
+  return categories
+
+
+def _categorize_positions_nltk(token_text_list, nltk_data_dir=None):
+  import nltk
+
+  if nltk_data_dir:
+    nltk.data.path.insert(0, nltk_data_dir)
+
+  groups = _group_token_pieces(token_text_list)
+  words = [group['text'] if group['text'] else group['surface'] for group in groups]
+  words = [word if word else '' for word in words]
+  tagged_words = nltk.pos_tag(words)
+
+  categories = ['OTHER'] * len(token_text_list)
+  for group, (_, tag) in zip(groups, tagged_words):
+    category = _classify_pos_tag(tag)
+    for position in group['positions']:
+      categories[position] = category
+  return categories
+
+
+def _categorize_positions(token_text_list, backend, nltk_data_dir=None):
+  if backend == 'nltk_pos':
+    try:
+      return _categorize_positions_nltk(
+        token_text_list, nltk_data_dir=nltk_data_dir)
+    except Exception:
+      return _categorize_positions_wordlist(token_text_list)
+  return _categorize_positions_wordlist(token_text_list)
+
+
+def _build_tfidf_similarity_backend(text_pool):
+  vectorizer = TfidfVectorizer(lowercase=True, ngram_range=(1, 2))
+  matrix = vectorizer.fit_transform(text_pool)
+  text_to_idx = {text: idx for idx, text in enumerate(text_pool)}
+
+  def sim(text_a, text_b):
+    if not text_a or not text_b:
+      return np.nan
+    idx_a = text_to_idx[text_a]
+    idx_b = text_to_idx[text_b]
+    return float(cosine_similarity(matrix[idx_a], matrix[idx_b])[0, 0])
+
+  return sim
+
+
+def _build_lsa_similarity_backend(text_pool, svd_components):
+  vectorizer = TfidfVectorizer(lowercase=True, ngram_range=(1, 2))
+  matrix = vectorizer.fit_transform(text_pool)
+  max_components = min(matrix.shape[0] - 1, matrix.shape[1] - 1, svd_components)
+  if max_components < 2:
+    return _build_tfidf_similarity_backend(text_pool), 'tfidf', [
+      'Diag1 LSA backend had too few texts/features for SVD; falling back to TF-IDF.'
+    ]
+
+  svd = TruncatedSVD(n_components=max_components, random_state=0)
+  embeddings = svd.fit_transform(matrix)
+  embeddings = sk_normalize(embeddings)
+  text_to_idx = {text: idx for idx, text in enumerate(text_pool)}
+
+  def sim(text_a, text_b):
+    if not text_a or not text_b:
+      return np.nan
+    idx_a = text_to_idx[text_a]
+    idx_b = text_to_idx[text_b]
+    return float(np.dot(embeddings[idx_a], embeddings[idx_b]))
+
+  notes = [f'Diag1 using LSA sentence-like embeddings with {max_components} dimensions.']
+  return sim, 'lsa', notes
+
+
+def _build_transformer_similarity_backend(text_pool, encoder_model, transformers_cache):
+  import torch
+  from transformers import AutoModel, AutoTokenizer
+
+  if transformers_cache:
+    os.environ['TRANSFORMERS_CACHE'] = transformers_cache
+
+  tokenizer = AutoTokenizer.from_pretrained(
+    encoder_model, local_files_only=True)
+  model = AutoModel.from_pretrained(
+    encoder_model, local_files_only=True)
+  model.eval()
+  if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token or tokenizer.sep_token
+
+  embeddings = []
+  batch_size = 32
+  with torch.no_grad():
+    for start in range(0, len(text_pool), batch_size):
+      batch = text_pool[start:start + batch_size]
+      encoded = tokenizer(
+        batch,
+        return_tensors='pt',
+        padding=True,
+        truncation=True,
+        max_length=256,
+      )
+      outputs = model(**encoded)
+      hidden = outputs.last_hidden_state
+      attn = encoded['attention_mask'].unsqueeze(-1)
+      pooled = (hidden * attn).sum(dim=1) / attn.sum(dim=1).clamp(min=1)
+      pooled = torch.nn.functional.normalize(pooled, dim=-1)
+      embeddings.append(pooled.cpu().numpy())
+  embeddings = np.concatenate(embeddings, axis=0)
+  text_to_idx = {text: idx for idx, text in enumerate(text_pool)}
+
+  def sim(text_a, text_b):
+    if not text_a or not text_b:
+      return np.nan
+    idx_a = text_to_idx[text_a]
+    idx_b = text_to_idx[text_b]
+    return float(np.dot(embeddings[idx_a], embeddings[idx_b]))
+
+  notes = [f'Diag1 using local transformer encoder: {encoder_model}']
+  return sim, 'transformer', notes
+
+
+def _resolve_diag1_backend(
+  requested_backend,
+  text_pool,
+  encoder_model=None,
+  transformers_cache=None,
+  svd_components=128,
+):
+  notes = []
+  if requested_backend == 'tfidf':
+    notes.append('Diag1 using TF-IDF cosine similarity.')
+    return _build_tfidf_similarity_backend(text_pool), 'tfidf', notes
+  if requested_backend == 'lsa':
+    sim_fn, backend_name, lsa_notes = _build_lsa_similarity_backend(
+      text_pool, svd_components)
+    return sim_fn, backend_name, notes + lsa_notes
+  if requested_backend == 'transformer':
+    if not encoder_model:
+      notes.append(
+        'Requested Diag1 transformer backend without --diag1_encoder_model; '
+        'falling back to LSA.')
+      sim_fn, backend_name, lsa_notes = _build_lsa_similarity_backend(
+        text_pool, svd_components)
+      return sim_fn, backend_name, notes + lsa_notes
+    try:
+      return _build_transformer_similarity_backend(
+        text_pool, encoder_model, transformers_cache)
+    except Exception as exc:
+      notes.append(
+        f'Diag1 transformer backend failed locally ({exc}); falling back to LSA.')
+      sim_fn, backend_name, lsa_notes = _build_lsa_similarity_backend(
+        text_pool, svd_components)
+      return sim_fn, backend_name, notes + lsa_notes
+
+  if encoder_model:
+    try:
+      sim_fn, backend_name, tf_notes = _build_transformer_similarity_backend(
+        text_pool, encoder_model, transformers_cache)
+      return sim_fn, backend_name, ['Diag1 auto backend selected transformer.'] + tf_notes
+    except Exception as exc:
+      notes.append(
+        f'Diag1 auto backend could not load local transformer encoder ({exc}); '
+        'falling back to LSA.')
+  else:
+    notes.append(
+      'Diag1 auto backend has no local encoder model specified; using LSA fallback.')
+  sim_fn, backend_name, lsa_notes = _build_lsa_similarity_backend(
+    text_pool, svd_components)
+  return sim_fn, backend_name, notes + lsa_notes
 
 
 def build_diag1_rows(runs, analysis_mode):
@@ -151,9 +463,19 @@ def build_diag1_rows(runs, analysis_mode):
   return rows
 
 
-def compute_diag1(diag1_rows):
+def compute_diag1(
+  diag1_rows,
+  diag1_backend='auto',
+  diag1_encoder_model=None,
+  diag1_svd_components=128,
+  transformers_cache=None,
+):
   if not diag1_rows:
-    return pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame(), pd.DataFrame(), {
+      'requested_backend': diag1_backend,
+      'actual_backend': None,
+      'notes': [],
+    }
 
   text_pool = set()
   for row in diag1_rows:
@@ -165,18 +487,19 @@ def compute_diag1(diag1_rows):
   text_pool = sorted(text for text in text_pool if text)
 
   if not text_pool:
-    return pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame(), pd.DataFrame(), {
+      'requested_backend': diag1_backend,
+      'actual_backend': None,
+      'notes': [],
+    }
 
-  vectorizer = TfidfVectorizer(lowercase=True, ngram_range=(1, 2))
-  matrix = vectorizer.fit_transform(text_pool)
-  text_to_idx = {text: idx for idx, text in enumerate(text_pool)}
-
-  def sim(text_a, text_b):
-    if not text_a or not text_b:
-      return np.nan
-    idx_a = text_to_idx[text_a]
-    idx_b = text_to_idx[text_b]
-    return float(cosine_similarity(matrix[idx_a], matrix[idx_b])[0, 0])
+  sim, backend_name, backend_notes = _resolve_diag1_backend(
+    diag1_backend,
+    text_pool,
+    encoder_model=diag1_encoder_model,
+    transformers_cache=transformers_cache,
+    svd_components=diag1_svd_components,
+  )
 
   detail_rows = []
   for row in diag1_rows:
@@ -202,7 +525,11 @@ def compute_diag1(diag1_rows):
       coherence=('coherence', 'mean'),
       relevance_to_gt=('relevance_to_gt', 'mean'),
       num_samples=('sample_index', 'count'))
-  return detail_df, summary_df
+  return detail_df, summary_df, {
+    'requested_backend': diag1_backend,
+    'actual_backend': backend_name,
+    'notes': backend_notes,
+  }
 
 
 def bucket_from_fraction(step_fraction):
@@ -217,7 +544,45 @@ def bucket_from_fraction(step_fraction):
   return BUCKET_LABELS[3]
 
 
-def compute_diag2(runs, analysis_mode):
+def _ranked_reveals(record, max_len):
+  step_list = record.get('first_unmask_step', [])[:max_len]
+  token_text_list = record.get('first_unmask_token_text', [])[:max_len]
+  revealed = []
+  for idx, (step, token_text) in enumerate(zip(step_list, token_text_list)):
+    if step is None or int(step) < 0:
+      continue
+    revealed.append({
+      'position': idx,
+      'step': int(step),
+      'token_text': token_text,
+    })
+  revealed.sort(key=lambda item: (item['step'], item['position']))
+  total = len(revealed)
+  if total == 0:
+    return []
+  ranked = []
+  for rank, item in enumerate(revealed):
+    rank_fraction = float((rank + 0.5) / total)
+    ranked.append({
+      'position': item['position'],
+      'step': item['step'],
+      'token_text': item['token_text'],
+      'rank': rank,
+      'rank_fraction': rank_fraction,
+      'total_revealed': total,
+    })
+  return ranked
+
+
+def compute_diag2(
+  runs,
+  analysis_mode,
+  timing_mode='global_step',
+  diag2_backend='auto',
+  nltk_data_dir=None,
+):
+  actual_backend, backend_notes = _resolve_diag2_backend(
+    diag2_backend, nltk_data_dir=nltk_data_dir)
   bucket_rows = []
   overall_rows = []
 
@@ -228,18 +593,31 @@ def compute_diag2(runs, analysis_mode):
 
     for record in run['records']:
       max_len = analysis_length(record, analysis_mode)
-      step_list = record.get('first_unmask_step', [])[:max_len]
-      step_frac_list = record.get('first_unmask_step_fraction', [])[:max_len]
-      token_text_list = record.get('first_unmask_token_text', [])[:max_len]
+      if timing_mode == 'reveal_rank':
+        timed_tokens = [
+          (item['step'], item['rank_fraction'], item['token_text'])
+          for item in _ranked_reveals(record, max_len)
+        ]
+      else:
+        step_list = record.get('first_unmask_step', [])[:max_len]
+        step_frac_list = record.get('first_unmask_step_fraction', [])[:max_len]
+        token_text_list = record.get('first_unmask_token_text', [])[:max_len]
+        timed_tokens = zip(step_list, step_frac_list, token_text_list)
 
-      for step, step_frac, token_text in zip(step_list, step_frac_list, token_text_list):
+      token_categories = _categorize_positions(
+        record.get('first_unmask_token_text', [])[:max_len],
+        backend=actual_backend,
+        nltk_data_dir=nltk_data_dir,
+      )
+
+      for pos_idx, (step, step_frac, token_text) in enumerate(timed_tokens):
         if step is None or int(step) < 0:
           continue
         step_fraction = float(step_frac) if step_frac is not None else np.nan
         bucket = bucket_from_fraction(step_fraction)
         if bucket is None:
           continue
-        category = classify_token(token_text)
+        category = token_categories[pos_idx] if pos_idx < len(token_categories) else 'OTHER'
         counts[bucket][category] += 1
         if category == 'CONTENT':
           content_steps.append(step_fraction)
@@ -275,10 +653,14 @@ def compute_diag2(runs, analysis_mode):
       'num_function_tokens': len(function_steps),
     })
 
-  return pd.DataFrame(bucket_rows), pd.DataFrame(overall_rows)
+  return pd.DataFrame(bucket_rows), pd.DataFrame(overall_rows), {
+    'requested_backend': diag2_backend,
+    'actual_backend': actual_backend,
+    'notes': backend_notes,
+  }
 
 
-def compute_diag3(runs, analysis_mode):
+def compute_diag3(runs, analysis_mode, timing_mode='global_step'):
   sample_rows = []
   summary_rows = []
 
@@ -288,12 +670,27 @@ def compute_diag3(runs, analysis_mode):
 
     for record in run['records']:
       max_len = analysis_length(record, analysis_mode)
-      total_steps = int(record.get('total_sampling_steps', 0) or 0)
-      if total_steps <= 0:
-        continue
-      early_cutoff = max(1, int(math.ceil(total_steps * early_fraction)))
-      step_list = record.get('first_unmask_step', [])[:max_len]
-      token_text_list = record.get('first_unmask_token_text', [])[:max_len]
+      if timing_mode == 'reveal_rank':
+        ranked_reveals = _ranked_reveals(record, max_len)
+        early_count = max(1, int(math.ceil(len(ranked_reveals) * early_fraction))) \
+          if ranked_reveals else 0
+        selected_reveals = ranked_reveals[:early_count]
+      else:
+        total_steps = int(record.get('total_sampling_steps', 0) or 0)
+        if total_steps <= 0:
+          continue
+        early_cutoff = max(1, int(math.ceil(total_steps * early_fraction)))
+        step_list = record.get('first_unmask_step', [])[:max_len]
+        token_text_list = record.get('first_unmask_token_text', [])[:max_len]
+        selected_reveals = []
+        for step, token_text in zip(step_list, token_text_list):
+          if step is None or int(step) < 0 or int(step) > early_cutoff:
+            continue
+          selected_reveals.append({
+            'step': int(step),
+            'token_text': token_text,
+          })
+
       gt_tokens = [
         normalize_piece(piece)
         for piece in record.get('gt_answer_token_text', [])[:max_len]
@@ -303,10 +700,8 @@ def compute_diag3(runs, analysis_mode):
         if token and token not in SPECIAL_TOKENS and any(ch.isalnum() for ch in token)]
 
       early_tokens = []
-      for step, token_text in zip(step_list, token_text_list):
-        if step is None or int(step) < 0 or int(step) > early_cutoff:
-          continue
-        token = normalize_piece(token_text)
+      for item in selected_reveals:
+        token = normalize_piece(item['token_text'])
         if not token or token in SPECIAL_TOKENS:
           continue
         if not any(ch.isalnum() for ch in token):
@@ -343,9 +738,22 @@ def main():
   runs = load_runs(args.run)
 
   diag1_rows = build_diag1_rows(runs, args.analysis_length)
-  diag1_detail_df, diag1_summary_df = compute_diag1(diag1_rows)
-  diag2_bucket_df, diag2_overall_df = compute_diag2(runs, args.analysis_length)
-  diag3_sample_df, diag3_summary_df = compute_diag3(runs, args.analysis_length)
+  diag1_detail_df, diag1_summary_df, diag1_meta = compute_diag1(
+    diag1_rows,
+    diag1_backend=args.diag1_backend,
+    diag1_encoder_model=args.diag1_encoder_model,
+    diag1_svd_components=args.diag1_svd_components,
+    transformers_cache=args.transformers_cache,
+  )
+  diag2_bucket_df, diag2_overall_df, diag2_meta = compute_diag2(
+    runs,
+    args.analysis_length,
+    timing_mode=args.timing_mode,
+    diag2_backend=args.diag2_backend,
+    nltk_data_dir=args.nltk_data_dir,
+  )
+  diag3_sample_df, diag3_summary_df = compute_diag3(
+    runs, args.analysis_length, timing_mode=args.timing_mode)
 
   outputs = {
     'diag1_detail.csv': diag1_detail_df,
@@ -361,6 +769,9 @@ def main():
   summary_payload = {
     'runs': [run['label'] for run in runs],
     'analysis_length': args.analysis_length,
+    'timing_mode': args.timing_mode,
+    'diag1_backend': diag1_meta,
+    'diag2_backend': diag2_meta,
     'diag1_summary': diag1_summary_df.to_dict(orient='records'),
     'diag2_overall_summary': diag2_overall_df.to_dict(orient='records'),
     'diag3_summary': diag3_summary_df.to_dict(orient='records'),
@@ -369,6 +780,14 @@ def main():
     json.dump(summary_payload, f, indent=2, ensure_ascii=False)
 
   print('Saved offline diagnostics to', args.output_dir)
+  if diag1_meta.get('actual_backend'):
+    print(f"\n[Diag1 backend] requested={diag1_meta['requested_backend']} actual={diag1_meta['actual_backend']}")
+    for note in diag1_meta.get('notes', []):
+      print(' ', note)
+  if diag2_meta.get('actual_backend'):
+    print(f"\n[Diag2 backend] requested={diag2_meta['requested_backend']} actual={diag2_meta['actual_backend']}")
+    for note in diag2_meta.get('notes', []):
+      print(' ', note)
   if not diag1_summary_df.empty:
     print('\n[Diag1] Early-step global coherence / relevance')
     print(diag1_summary_df.to_string(index=False))
