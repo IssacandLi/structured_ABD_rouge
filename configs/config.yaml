@@ -29,6 +29,8 @@ sampling:
   num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   num_cond_batches: 1
   num_eval_samples: 0  # If > 0, conditional eval stops after exactly this many samples.
+  num_cond_samples: null
+  shuffle_valid: True
   var_length: False
   logdir: ./samples_${algo.name}_len${model.length}_blocksize${block_size}
   nucleus_p: 1.0
@@ -39,6 +41,7 @@ diagnostics:
   enabled: False
   save_path: null
   snapshot_reveal_fractions: [0.1, 0.3, 0.5, 0.7]
+  snapshot_step_fractions: [0.1, 0.3, 0.5, 0.7]
   early_fraction: 0.3
 
 training:
@@ -58,6 +61,8 @@ eval:
   perplexity_batch_size: 8
   compute_perplexity_on_sanity: False
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
+  conditional_metric: ppl  # ppl / rouge / both
+  conditional_eval_metric: ppl  # ppl / rouge / both
   generate_samples: False
 
 optim:

@@ -120,7 +120,12 @@ def generate_samples(config, logger, tokenizer):
   if conditional:
     logger.info('Conditional sampling: using dataloader prefixes and generating answer tokens.')
     _, valid_dl = dataloader.get_dataloaders(
-      config, tokenizer, skip_train=True, valid_seed=config.seed)
+      config,
+      tokenizer,
+      skip_train=True,
+      valid_seed=(
+        config.seed if bool(getattr(config.sampling, 'shuffle_valid', True))
+        else None))
 
     preds = []
     prefixes = []
@@ -277,6 +282,8 @@ def generate_samples(config, logger, tokenizer):
           'sampling_logdir': str(config.sampling.logdir),
           'snapshot_reveal_fractions': list(
             getattr(config.diagnostics, 'snapshot_reveal_fractions', [])),
+          'snapshot_step_fractions': list(
+            getattr(config.diagnostics, 'snapshot_step_fractions', [])),
           'early_fraction': float(getattr(config.diagnostics, 'early_fraction', 0.3)),
           'structured_inference_enabled': bool(
             getattr(getattr(config.algo, 'structured_inference', None), 'enabled', False)),

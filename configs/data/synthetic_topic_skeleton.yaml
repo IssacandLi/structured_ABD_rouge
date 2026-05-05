@@ -1,0 +1,29 @@
+train: ndp_topic_skeleton
+valid: ndp_topic_skeleton
+tokenizer_name_or_path: gpt2
+cache_dir: /data/lab/yan/peihong_li/data_cache/ndp_pilot
+wrap: False
+streaming: False
+
+insert_train_eos: True
+insert_valid_eos: True
+insert_train_special: True
+insert_valid_special: True
+
+# Generate raw JSONL with scripts/ndp/prepare_topic_skeleton.py and pass:
+#   data.local_data_dir=/data/lab/yan/peihong_li/data_cache/ndp_pilot/raw/synthetic_topic_skeleton
+conditional_generation: True
+hf_dataset_name: null
+hf_dataset_config: null
+local_data_dir: /data/lab/yan/peihong_li/data_cache/ndp_pilot/raw/synthetic_topic_skeleton
+local_train_file: train.jsonl
+local_validation_file: validation.jsonl
+prompt_field: prompt
+answer_field: story
+
+sample_fraction: 1.0
+max_train_samples: null
+max_valid_samples: null
+prefix_max_tokens: 64
+answer_max_tokens: 957
+loss_on_answer_eos: True

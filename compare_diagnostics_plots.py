@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -81,6 +82,31 @@ def _save_tables(output_dir, diag1_detail_df, diag1_summary_df,
   }
   for filename, df in outputs.items():
     df.to_csv(os.path.join(output_dir, filename), index=False)
+
+
+def _save_summary_json(
+  output_dir,
+  runs,
+  args,
+  diag1_meta,
+  diag2_meta,
+  diag1_summary_df,
+  diag2_overall_df,
+  diag3_summary_df,
+):
+  payload = {
+    'runs': [run['label'] for run in runs],
+    'title': args.title,
+    'analysis_length': args.analysis_length,
+    'timing_mode': args.timing_mode,
+    'diag1_backend': diag1_meta,
+    'diag2_backend': diag2_meta,
+    'diag1_summary': diag1_summary_df.to_dict(orient='records'),
+    'diag2_overall_summary': diag2_overall_df.to_dict(orient='records'),
+    'diag3_summary': diag3_summary_df.to_dict(orient='records'),
+  }
+  with open(os.path.join(output_dir, 'summary.json'), 'w', encoding='utf-8') as f:
+    json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def _plot_diag1(ax, df, y_key, title, ylabel):
@@ -201,6 +227,16 @@ def main():
     diag1_detail_df, diag1_summary_df,
     diag2_bucket_df, diag2_overall_df,
     diag3_sample_df, diag3_summary_df,
+  )
+  _save_summary_json(
+    args.output_dir,
+    runs,
+    args,
+    diag1_meta,
+    diag2_meta,
+    diag1_summary_df,
+    diag2_overall_df,
+    diag3_summary_df,
   )
 
   fig, axes = plt.subplots(2, 2, figsize=(14, 10))

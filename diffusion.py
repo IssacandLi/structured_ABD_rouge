@@ -148,6 +148,8 @@ class Diffusion(L.LightningModule):
       getattr(diagnostics_cfg, 'enabled', False))
     self.diagnostics_snapshot_reveal_fractions = list(
       getattr(diagnostics_cfg, 'snapshot_reveal_fractions', [0.1, 0.3, 0.5, 0.7]))
+    self.diagnostics_snapshot_step_fractions = list(
+      getattr(diagnostics_cfg, 'snapshot_step_fractions', [0.1, 0.3, 0.5, 0.7]))
     self.diagnostics_early_fraction = float(
       getattr(diagnostics_cfg, 'early_fraction', 0.3))
     self._last_sampling_diagnostics = []
@@ -160,12 +162,15 @@ class Diffusion(L.LightningModule):
         self.cinf_aggregation = self.config.algo.structured_inference.aggregation
         self.cinf_commitment = self.config.algo.structured_inference.commitment
         self.cinf_threshold = self.config.algo.structured_inference.threshold
+        self.cinf_confidence = getattr(
+            self.config.algo.structured_inference, 'confidence', 'top1')
         # 验证 C 的参数也已加载（C-inf 复用 s(t) 公式）
         assert self.structured_masking, \
             "C-inf requires structured_masking to be enabled (need r_low, r_high, b_max_tokens)"
         print("=" * 50)
         print("  [C-inf] Structured inference ENABLED")
         print(f"  aggregation={self.cinf_aggregation}")
+        print(f"  confidence={self.cinf_confidence}")
         print(f"  commitment={self.cinf_commitment}")
         print(f"  Reusing C params: r_low={self.sm_r_low}, r_high={self.sm_r_high}, B_max={self.sm_b_max_tokens}")
         print("=" * 50)
@@ -1153,6 +1158,7 @@ class Diffusion(L.LightningModule):
         tokenizer=self.tokenizer,
         mask_index=self.mask_index,
         snapshot_reveal_fractions=self.diagnostics_snapshot_reveal_fractions,
+        snapshot_step_fractions=self.diagnostics_snapshot_step_fractions,
         early_fraction=self.diagnostics_early_fraction)
       diagnostics_recorder.start(
         x0=x0,
@@ -1782,6 +1788,40 @@ class Diffusion(L.LightningModule):
       return confidences.topk(k).values.mean().item()
     raise ValueError(f'Unknown C-inf aggregation mode: {mode}')
 
+  def _compute_token_confidence(self, token_probs):
+    """Compute model confidence from the non-MASK token distribution."""
+    if token_probs.numel() == 0:
+      return token_probs.new_empty((0,))
+
+    non_mask_probs = token_probs.clone()
+    if 0 <= self.mask_index < non_mask_probs.shape[-1]:
+      non_mask_probs[:, self.mask_index] = 0.0
+
+    non_mask_mass = non_mask_probs.sum(dim=-1, keepdim=True)
+    valid = non_mask_mass.squeeze(-1) > 1e-12
+    non_mask_probs = non_mask_probs / non_mask_mass.clamp(min=1e-12)
+
+    mode = getattr(self, 'cinf_confidence', 'top1')
+    if mode in {'top1', 'top1_prob'}:
+      confidence = non_mask_probs.max(dim=-1).values
+      return torch.where(valid, confidence, torch.zeros_like(confidence))
+
+    if mode == 'margin':
+      k = min(2, non_mask_probs.shape[-1])
+      topk = non_mask_probs.topk(k, dim=-1).values
+      confidence = topk[:, 0] if k == 1 else topk[:, 0] - topk[:, 1]
+      return torch.where(valid, confidence, torch.zeros_like(confidence))
+
+    if mode in {'neg_entropy', 'negative_entropy'}:
+      safe_probs = non_mask_probs.clamp(min=1e-12)
+      entropy = - (safe_probs * safe_probs.log()).sum(dim=-1)
+      confidence = -entropy
+      low_confidence = torch.full_like(
+          confidence, -math.log(max(non_mask_probs.shape[-1] - 1, 2)))
+      return torch.where(valid, confidence, low_confidence)
+
+    raise ValueError(f'Unknown C-inf confidence mode: {mode}')
+
   def _adaptive_confidence_threshold(self, confidences, s):
     mean = confidences.mean()
     std = confidences.std(unbiased=False)
@@ -1891,7 +1931,7 @@ class Diffusion(L.LightningModule):
                 continue
             pos_tensor = span_token_ids[still_masked]
 
-            token_conf = 1.0 - probs[b, pos_tensor, self.mask_index]
+            token_conf = self._compute_token_confidence(probs[b, pos_tensor])
             span_conf = self._aggregate_span_confidence(token_conf)
             span_info.append({'pos_tensor': pos_tensor, 'confidence': span_conf})
 

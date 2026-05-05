@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import itertools
 import json
 import math
@@ -20,6 +21,98 @@ import transformers
 import utils
 
 LOGGER = utils.get_logger(__name__)
+
+CONDITIONAL_TEXT_DATASETS = {
+  'writing_prompts',
+  'writingprompts',
+  'wp',
+  'ndp_topic_skeleton',
+  'synthetic_topic_skeleton',
+  'ndp_synthetic_topic',
+}
+
+
+def _safe_tag(value):
+  value = '' if value is None else str(value)
+  value = re.sub(r'[^A-Za-z0-9_.-]+', '_', value).strip('_')
+  return value[:64] or 'none'
+
+
+def _is_conditional_text_dataset(dataset_name):
+  return str(dataset_name).lower() in CONDITIONAL_TEXT_DATASETS
+
+
+def _default_hf_dataset_name(dataset_name):
+  if str(dataset_name).lower() in {'writing_prompts', 'writingprompts', 'wp'}:
+    return 'euclaise/writingprompts'
+  return dataset_name
+
+
+def _mode_to_split(mode):
+  if mode in {'valid', 'validation'}:
+    return 'validation'
+  return mode
+
+
+def _load_conditional_text_dataset(
+    dataset_name,
+    mode,
+    cache_dir,
+    streaming=False,
+    revision=None,
+    hf_dataset_name=None,
+    hf_dataset_config=None,
+    local_data_dir=None,
+    local_train_file=None,
+    local_validation_file=None,
+    local_test_file=None,
+    sample_fraction=1.0,
+    max_samples=None,
+    seed=1):
+  split = _mode_to_split(mode)
+
+  if local_data_dir:
+    local_data_dir = os.path.expanduser(str(local_data_dir))
+    data_files = {}
+    for split_name, filename in [
+        ('train', local_train_file or 'train.jsonl'),
+        ('validation', local_validation_file or 'validation.jsonl'),
+        ('test', local_test_file or 'test.jsonl')]:
+      path = os.path.join(local_data_dir, filename)
+      if os.path.exists(path):
+        data_files[split_name] = path
+    if split not in data_files:
+      available = ', '.join(sorted(data_files)) or 'none'
+      raise ValueError(
+        f'Missing local split {split!r} for {dataset_name}; available: {available}')
+    dataset = datasets.load_dataset(
+      'json',
+      data_files=data_files,
+      cache_dir=cache_dir,
+      streaming=streaming)
+    data = dataset[split]
+  else:
+    hf_name = hf_dataset_name or _default_hf_dataset_name(dataset_name)
+    load_kwargs = dict(
+      split=split,
+      cache_dir=cache_dir,
+      streaming=streaming,
+      revision=revision,
+      trust_remote_code=True)
+    if hf_dataset_config:
+      data = datasets.load_dataset(hf_name, hf_dataset_config, **load_kwargs)
+    else:
+      data = datasets.load_dataset(hf_name, **load_kwargs)
+
+  if streaming:
+    return data
+
+  if sample_fraction is not None and float(sample_fraction) < 1.0:
+    n_keep = max(1, int(len(data) * float(sample_fraction)))
+    data = data.shuffle(seed=int(seed)).select(range(n_keep))
+  if max_samples is not None and int(max_samples) > 0:
+    data = data.select(range(min(int(max_samples), len(data))))
+  return data
 
 
 def wt_detokenizer(string):
@@ -317,7 +410,18 @@ def get_dataset(
     cnn_dm_version: str = "3.0.0",
     prefix_max_tokens: Optional[int] = None,
     answer_max_tokens: Optional[int] = None,
-    loss_on_answer_eos: bool = True,):
+    loss_on_answer_eos: bool = True,
+    prompt_field: str = 'prompt',
+    answer_field: str = 'story',
+    hf_dataset_name: Optional[str] = None,
+    hf_dataset_config: Optional[str] = None,
+    local_data_dir: Optional[str] = None,
+    local_train_file: Optional[str] = None,
+    local_validation_file: Optional[str] = None,
+    local_test_file: Optional[str] = None,
+    sample_fraction: float = 1.0,
+    max_samples: Optional[int] = None,
+    data_seed: int = 1,):
   eos_tag = ''
   if not insert_eos:
     eos_tag = '_eosFalse'
@@ -333,11 +437,19 @@ def get_dataset(
   cnn_tag = ""
   if dataset_name in ["cnn_dailymail", "abisee/cnn_dailymail"]:
       cnn_tag = f"_cnn{cnn_dm_version}_p{prefix_max_tokens}_a{answer_max_tokens}_lossEOS{int(loss_on_answer_eos)}"
+  pair_tag = ""
+  if _is_conditional_text_dataset(dataset_name):
+      source_tag = hf_dataset_name or local_data_dir or dataset_name
+      source_hash = hashlib.md5(str(source_tag).encode('utf-8')).hexdigest()[:8]
+      pair_tag = (
+        f"_pair{source_hash}_{_safe_tag(prompt_field)}2{_safe_tag(answer_field)}"
+        f"_p{prefix_max_tokens}_a{answer_max_tokens}"
+        f"_frac{sample_fraction}_max{max_samples}_lossEOS{int(loss_on_answer_eos)}")
 
   if wrap:
-      filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped{eos_tag}{cnn_tag}.dat'
+      filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped{eos_tag}{cnn_tag}{pair_tag}.dat'
   else:
-      filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped{eos_tag}{cnn_tag}.dat'
+      filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped{eos_tag}{cnn_tag}{pair_tag}.dat'
   _path = os.path.join(cache_dir, filename)
 
   
@@ -426,6 +538,23 @@ def get_dataset(
       revision=revision,
       trust_remote_code=True,
     )
+  elif _is_conditional_text_dataset(dataset_name):
+    dataset = _load_conditional_text_dataset(
+      dataset_name=dataset_name,
+      mode=mode,
+      cache_dir=cache_dir,
+      streaming=streaming,
+      revision=revision,
+      hf_dataset_name=hf_dataset_name,
+      hf_dataset_config=hf_dataset_config,
+      local_data_dir=local_data_dir,
+      local_train_file=local_train_file,
+      local_validation_file=local_validation_file,
+      local_test_file=local_test_file,
+      sample_fraction=sample_fraction,
+      max_samples=max_samples,
+      seed=data_seed,
+    )
   else:
     dataset = datasets.load_dataset(
       dataset_name,
@@ -434,7 +563,9 @@ def get_dataset(
       trust_remote_code=True,
       revision=revision)
 
-  if dataset_name in ['lambada', 'openwebtext-train',
+  if _is_conditional_text_dataset(dataset_name):
+    data = dataset
+  elif dataset_name in ['lambada', 'openwebtext-train',
                       'openwebtext-valid']:
     data = dataset
   else:
@@ -538,6 +669,65 @@ def get_dataset(
         attn_mask_batch.append(mask)
 
       return {"input_ids": input_ids_batch, "attention_mask": attn_mask_batch}
+
+    if _is_conditional_text_dataset(dataset_name):
+      if prompt_field not in example or answer_field not in example:
+        raise KeyError(
+          f'Conditional text dataset requires fields {prompt_field!r} and '
+          f'{answer_field!r}; available fields are {list(example.keys())}.')
+      prompts = example[prompt_field]
+      answers = example[answer_field]
+
+      if prefix_max_tokens is None:
+        _prefix_max = min(128, max(0, block_size // 4))
+      else:
+        _prefix_max = prefix_max_tokens
+      if answer_max_tokens is None:
+        _answer_max = max(1, block_size - _prefix_max - 3)
+      else:
+        _answer_max = answer_max_tokens
+
+      input_ids_batch = []
+      attn_mask_batch = []
+      pad_id = tokenizer.pad_token_id
+
+      for prompt, answer in zip(prompts, answers):
+        if isinstance(prompt, (list, tuple)):
+          prompt = ' '.join(str(x) for x in prompt)
+        if isinstance(answer, (list, tuple)):
+          answer = ' '.join(str(x) for x in answer)
+        prefix_ids = tokenizer(
+          str(prompt or ''),
+          add_special_tokens=False,
+          truncation=True,
+          max_length=_prefix_max,
+          return_attention_mask=False,
+        )["input_ids"]
+        answer_ids = tokenizer(
+          str(answer or ''),
+          add_special_tokens=False,
+          truncation=True,
+          max_length=_answer_max,
+          return_attention_mask=False,
+        )["input_ids"]
+
+        ids = [BOS] + prefix_ids + [EOS] + answer_ids + [EOS]
+        ids = ids[:block_size]
+        if len(ids) < block_size:
+          ids = ids + [pad_id] * (block_size - len(ids))
+
+        ans_start = 1 + len(prefix_ids) + 1
+        ans_len = len(answer_ids) + (1 if loss_on_answer_eos else 0)
+        ans_end = min(block_size, ans_start + ans_len)
+        mask = [0] * block_size
+        for j in range(ans_start, ans_end):
+          if ids[j] != pad_id:
+            mask[j] = 1
+
+        input_ids_batch.append(ids)
+        attn_mask_batch.append(mask)
+
+      return {"input_ids": input_ids_batch, "attention_mask": attn_mask_batch}
     # -------------------------------
     # Original logic for other datasets
     # -------------------------------
@@ -597,6 +787,14 @@ def get_dataset(
   elif dataset_name in ["cnn_dailymail", "abisee/cnn_dailymail"]:
     tokenized_dataset = tokenized_dataset.remove_columns(['article', 
       'highlights', 'id'])
+
+  elif _is_conditional_text_dataset(dataset_name):
+    keep_columns = {'input_ids', 'attention_mask'}
+    remove_columns = [
+      column for column in tokenized_dataset.column_names
+      if column not in keep_columns]
+    if remove_columns:
+      tokenized_dataset = tokenized_dataset.remove_columns(remove_columns)
 
   elif 'scientific_papers' in dataset_name:
     tokenized_dataset = tokenized_dataset.remove_columns([
@@ -711,7 +909,18 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cnn_dm_version=getattr(config.data, "cnn_dm_version", "3.0.0"),
       prefix_max_tokens=getattr(config.data, "prefix_max_tokens", None),
       answer_max_tokens=getattr(config.data, "answer_max_tokens", None),
-      loss_on_answer_eos=getattr(config.data, "loss_on_answer_eos", True),)
+      loss_on_answer_eos=getattr(config.data, "loss_on_answer_eos", True),
+      prompt_field=getattr(config.data, "prompt_field", "prompt"),
+      answer_field=getattr(config.data, "answer_field", "story"),
+      hf_dataset_name=getattr(config.data, "hf_dataset_name", None),
+      hf_dataset_config=getattr(config.data, "hf_dataset_config", None),
+      local_data_dir=getattr(config.data, "local_data_dir", None),
+      local_train_file=getattr(config.data, "local_train_file", None),
+      local_validation_file=getattr(config.data, "local_validation_file", None),
+      local_test_file=getattr(config.data, "local_test_file", None),
+      sample_fraction=getattr(config.data, "sample_fraction", 1.0),
+      max_samples=getattr(config.data, "max_train_samples", None),
+      data_seed=getattr(config, "seed", 1),)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -735,7 +944,18 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cnn_dm_version=getattr(config.data, "cnn_dm_version", "3.0.0"),
       prefix_max_tokens=getattr(config.data, "prefix_max_tokens", None),
       answer_max_tokens=getattr(config.data, "answer_max_tokens", None),
-      loss_on_answer_eos=getattr(config.data, "loss_on_answer_eos", True),)
+      loss_on_answer_eos=getattr(config.data, "loss_on_answer_eos", True),
+      prompt_field=getattr(config.data, "prompt_field", "prompt"),
+      answer_field=getattr(config.data, "answer_field", "story"),
+      hf_dataset_name=getattr(config.data, "hf_dataset_name", None),
+      hf_dataset_config=getattr(config.data, "hf_dataset_config", None),
+      local_data_dir=getattr(config.data, "local_data_dir", None),
+      local_train_file=getattr(config.data, "local_train_file", None),
+      local_validation_file=getattr(config.data, "local_validation_file", None),
+      local_test_file=getattr(config.data, "local_test_file", None),
+      sample_fraction=getattr(config.data, "sample_fraction", 1.0),
+      max_samples=getattr(config.data, "max_valid_samples", None),
+      data_seed=getattr(config, "seed", 1),)
 
   if skip_train:
     train_loader = None

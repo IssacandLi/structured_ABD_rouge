@@ -1,4 +1,5 @@
 import argparse
+import functools
 import json
 import math
 import os
@@ -38,6 +39,10 @@ CONTENT_POS_TAGS = {'RB', 'RBR', 'RBS'}
 FUNCTION_POS_TAGS = {
   'DT', 'PDT', 'WDT', 'IN', 'CC', 'TO', 'PRP', 'PRP$',
   'WP', 'WP$', 'WRB', 'MD', 'EX', 'POS', 'RP', 'UH',
+}
+CONTENT_UPOS_TAGS = {'NOUN', 'PROPN', 'VERB', 'ADJ', 'ADV', 'NUM'}
+FUNCTION_UPOS_TAGS = {
+  'DET', 'ADP', 'CCONJ', 'SCONJ', 'PART', 'PRON', 'AUX',
 }
 
 
@@ -84,21 +89,32 @@ def parse_args():
     default=128,
     help='Number of SVD dimensions for LSA-based Diag1 embeddings.')
   parser.add_argument(
+    '--diag1_coherence_mode',
+    choices=['position_bins', 'revealed_chunks'],
+    default='position_bins',
+    help=(
+      'How to compute Diag1 coherence. '
+      '"position_bins" splits the full answer span into 4 position quartiles; '
+      '"revealed_chunks" preserves the older split-over-revealed-token behavior.'))
+  parser.add_argument(
     '--transformers_cache',
     default=None,
     help='Writable cache directory to use when loading local transformer models.')
   parser.add_argument(
     '--diag2_backend',
-    choices=['auto', 'wordlist', 'nltk_pos'],
+    choices=['auto', 'wordlist', 'nltk_pos', 'spacy_pos'],
     default='auto',
     help=(
       'Classifier backend for Diag2. '
-      '"auto" uses NLTK POS tagging when local tagger data is available, '
-      'otherwise falls back to wordlist heuristics.'))
+      '"auto" prefers spaCy POS tagging, then NLTK, then wordlist heuristics.'))
   parser.add_argument(
     '--nltk_data_dir',
     default=None,
     help='Optional local NLTK data directory containing the averaged perceptron tagger.')
+  parser.add_argument(
+    '--spacy_model',
+    default='en_core_web_sm',
+    help='spaCy model package/path to use for Diag2 POS tagging.')
   return parser.parse_args()
 
 
@@ -131,6 +147,16 @@ def normalize_word(text):
   token = normalize_piece(text)
   token = re.sub(r'^[^\w]+', '', token)
   token = re.sub(r'[^\w]+$', '', token)
+  return token
+
+
+def normalize_surface_word(text):
+  if text is None:
+    return ''
+  token = str(text).replace('\n', ' ').strip()
+  token = re.sub(r'^[^\w]+', '', token)
+  token = re.sub(r'[^\w]+$', '', token)
+  token = re.sub(r'\s+', ' ', token).strip()
   return token
 
 
@@ -212,6 +238,16 @@ def _classify_pos_tag(tag):
   return 'OTHER'
 
 
+def _classify_spacy_token(token):
+  upos = (getattr(token, 'pos_', None) or '').upper()
+  if upos in FUNCTION_UPOS_TAGS:
+    return 'FUNCTION'
+  if upos in CONTENT_UPOS_TAGS:
+    return 'CONTENT'
+  tag = getattr(token, 'tag_', None)
+  return _classify_pos_tag(tag)
+
+
 def _nltk_tagger_available(nltk_data_dir=None):
   try:
     import nltk
@@ -223,8 +259,32 @@ def _nltk_tagger_available(nltk_data_dir=None):
     return False
 
 
-def _resolve_diag2_backend(requested_backend, nltk_data_dir=None):
+@functools.lru_cache(maxsize=None)
+def _load_spacy_model_cached(spacy_model):
+  import spacy
+
+  return spacy.load(spacy_model)
+
+
+def _spacy_tagger_available(spacy_model='en_core_web_sm'):
+  try:
+    nlp = _load_spacy_model_cached(spacy_model)
+  except Exception:
+    return False
+  return any(name in nlp.pipe_names for name in ('tagger', 'morphologizer'))
+
+
+def _resolve_diag2_backend(requested_backend, nltk_data_dir=None, spacy_model='en_core_web_sm'):
   notes = []
+  if requested_backend == 'spacy_pos':
+    if _spacy_tagger_available(spacy_model=spacy_model):
+      return 'spacy_pos', notes
+    notes.append(
+      f'Requested Diag2 backend "spacy_pos" but spaCy model '
+      f'"{spacy_model}" is unavailable; falling back to NLTK/wordlist.')
+    if _nltk_tagger_available(nltk_data_dir=nltk_data_dir):
+      return 'nltk_pos', notes
+    return 'wordlist', notes
   if requested_backend == 'wordlist':
     return 'wordlist', notes
   if requested_backend == 'nltk_pos':
@@ -234,11 +294,15 @@ def _resolve_diag2_backend(requested_backend, nltk_data_dir=None):
       'Requested Diag2 backend "nltk_pos" but local averaged_perceptron_tagger '
       'data is unavailable; falling back to wordlist heuristics.')
     return 'wordlist', notes
+  if _spacy_tagger_available(spacy_model=spacy_model):
+    notes.append(
+      f'Diag2 auto backend selected spaCy POS tagging ({spacy_model}).')
+    return 'spacy_pos', notes
   if _nltk_tagger_available(nltk_data_dir=nltk_data_dir):
     notes.append('Diag2 auto backend selected local NLTK POS tagging.')
     return 'nltk_pos', notes
   notes.append(
-    'Diag2 auto backend could not find local NLTK tagger data; '
+    'Diag2 auto backend could not find a usable spaCy/NLTK POS tagger; '
     'using wordlist heuristics.')
   return 'wordlist', notes
 
@@ -271,7 +335,45 @@ def _categorize_positions_nltk(token_text_list, nltk_data_dir=None):
   return categories
 
 
-def _categorize_positions(token_text_list, backend, nltk_data_dir=None):
+def _categorize_positions_spacy(token_text_list, spacy_model='en_core_web_sm'):
+  from spacy.tokens import Doc
+
+  nlp = _load_spacy_model_cached(spacy_model)
+  groups = _group_token_pieces(token_text_list)
+  categories = ['OTHER'] * len(token_text_list)
+  taggable_groups = []
+  words = []
+  for group in groups:
+    word = normalize_surface_word(group['surface'])
+    if not word or not any(ch.isalnum() for ch in word):
+      continue
+    taggable_groups.append(group)
+    words.append(word)
+
+  if not words:
+    return categories
+
+  doc = Doc(nlp.vocab, words=words)
+  for _, proc in nlp.pipeline:
+    doc = proc(doc)
+
+  for group, token in zip(taggable_groups, doc):
+    category = _classify_spacy_token(token)
+    for position in group['positions']:
+      categories[position] = category
+  return categories
+
+
+def _categorize_positions(token_text_list, backend, nltk_data_dir=None, spacy_model='en_core_web_sm'):
+  if backend == 'spacy_pos':
+    try:
+      return _categorize_positions_spacy(
+        token_text_list, spacy_model=spacy_model)
+    except Exception:
+      if _nltk_tagger_available(nltk_data_dir=nltk_data_dir):
+        return _categorize_positions_nltk(
+          token_text_list, nltk_data_dir=nltk_data_dir)
+      return _categorize_positions_wordlist(token_text_list)
   if backend == 'nltk_pos':
     try:
       return _categorize_positions_nltk(
@@ -418,6 +520,38 @@ def _resolve_diag1_backend(
   return sim_fn, backend_name, notes + lsa_notes
 
 
+def _build_position_bin_segments(revealed_items, max_len):
+  if max_len <= 0:
+    return []
+  position_to_piece = {
+    int(pos): piece for pos, piece in revealed_items
+    if int(pos) < max_len
+  }
+  segments = []
+  for indices in np.array_split(np.arange(max_len), 4):
+    segment_text = join_pieces([
+      position_to_piece[int(pos)]
+      for pos in indices.tolist()
+      if int(pos) in position_to_piece
+    ])
+    if segment_text:
+      segments.append(segment_text)
+  return segments
+
+
+def _build_revealed_chunk_segments(clipped_pieces):
+  segments = []
+  if clipped_pieces:
+    split_indices = np.array_split(np.arange(len(clipped_pieces)), 4)
+    for indices in split_indices:
+      if len(indices) == 0:
+        continue
+      segment_text = join_pieces([clipped_pieces[idx] for idx in indices.tolist()])
+      if segment_text:
+        segments.append(segment_text)
+  return segments
+
+
 def build_diag1_rows(runs, analysis_mode):
   rows = []
   for run in runs:
@@ -428,6 +562,7 @@ def build_diag1_rows(runs, analysis_mode):
       for snapshot in record.get('snapshots', []):
         if not snapshot.get('captured', False):
           continue
+        revealed_items = []
         clipped_pieces = []
         for pos, piece in zip(
           snapshot.get('revealed_positions', []),
@@ -435,30 +570,61 @@ def build_diag1_rows(runs, analysis_mode):
         ):
           if max_len and int(pos) >= max_len:
             continue
+          revealed_items.append((int(pos), piece))
           clipped_pieces.append(piece)
         revealed_text = join_pieces(clipped_pieces)
         if not revealed_text:
           continue
 
-        segments = []
-        if clipped_pieces:
-          split_indices = np.array_split(np.arange(len(clipped_pieces)), 4)
-          for indices in split_indices:
-            if len(indices) == 0:
-              continue
-            segment_text = join_pieces([clipped_pieces[idx] for idx in indices.tolist()])
-            if segment_text:
-              segments.append(segment_text)
-
         rows.append({
           'run': run['label'],
           'sample_index': int(record.get('global_sample_index', len(rows))),
+          'snapshot_source': 'reveal_fraction',
           'target_reveal_fraction': float(snapshot['target_reveal_fraction']),
+          'target_step_fraction': np.nan,
           'step_index': snapshot.get('step_index'),
           'revealed_fraction': snapshot.get('revealed_fraction'),
           'revealed_text': revealed_text,
           'gt_text': gt_text,
-          'segments': segments,
+          'position_bin_segments': _build_position_bin_segments(
+            revealed_items, max_len),
+          'revealed_chunk_segments': _build_revealed_chunk_segments(
+            clipped_pieces),
+        })
+
+      for snapshot in record.get('step_snapshots', []):
+        if not snapshot.get('captured', False):
+          continue
+        revealed_items = []
+        clipped_pieces = []
+        for pos, piece in zip(
+          snapshot.get('visible_positions', []),
+          snapshot.get('visible_token_text', []),
+        ):
+          if max_len and int(pos) >= max_len:
+            continue
+          revealed_items.append((int(pos), piece))
+          clipped_pieces.append(piece)
+        revealed_text = snapshot.get('partial_text') or join_pieces(clipped_pieces)
+        if not revealed_text:
+          continue
+
+        target_step_fraction = float(snapshot['target_step_fraction'])
+        rows.append({
+          'run': run['label'],
+          'sample_index': int(record.get('global_sample_index', len(rows))),
+          'snapshot_source': 'step_fraction',
+          # Keep this legacy column populated so existing plotting scripts still work.
+          'target_reveal_fraction': target_step_fraction,
+          'target_step_fraction': target_step_fraction,
+          'step_index': snapshot.get('step_index'),
+          'revealed_fraction': snapshot.get('revealed_fraction'),
+          'revealed_text': revealed_text,
+          'gt_text': gt_text,
+          'position_bin_segments': _build_position_bin_segments(
+            revealed_items, max_len),
+          'revealed_chunk_segments': _build_revealed_chunk_segments(
+            clipped_pieces),
         })
   return rows
 
@@ -468,12 +634,14 @@ def compute_diag1(
   diag1_backend='auto',
   diag1_encoder_model=None,
   diag1_svd_components=128,
+  diag1_coherence_mode='position_bins',
   transformers_cache=None,
 ):
   if not diag1_rows:
     return pd.DataFrame(), pd.DataFrame(), {
       'requested_backend': diag1_backend,
       'actual_backend': None,
+      'coherence_mode': diag1_coherence_mode,
       'notes': [],
     }
 
@@ -482,7 +650,12 @@ def compute_diag1(
     text_pool.add(row['revealed_text'])
     if row['gt_text']:
       text_pool.add(row['gt_text'])
-    for segment in row['segments']:
+    segment_key = (
+      'position_bin_segments'
+      if diag1_coherence_mode == 'position_bins'
+      else 'revealed_chunk_segments'
+    )
+    for segment in row[segment_key]:
       text_pool.add(segment)
   text_pool = sorted(text for text in text_pool if text)
 
@@ -490,6 +663,7 @@ def compute_diag1(
     return pd.DataFrame(), pd.DataFrame(), {
       'requested_backend': diag1_backend,
       'actual_backend': None,
+      'coherence_mode': diag1_coherence_mode,
       'notes': [],
     }
 
@@ -503,16 +677,23 @@ def compute_diag1(
 
   detail_rows = []
   for row in diag1_rows:
+    segments = row[
+      'position_bin_segments'
+      if diag1_coherence_mode == 'position_bins'
+      else 'revealed_chunk_segments'
+    ]
     segment_sims = []
-    for i in range(len(row['segments'])):
-      for j in range(i + 1, len(row['segments'])):
-        segment_sims.append(sim(row['segments'][i], row['segments'][j]))
+    for i in range(len(segments)):
+      for j in range(i + 1, len(segments)):
+        segment_sims.append(sim(segments[i], segments[j]))
     coherence = float(np.mean(segment_sims)) if segment_sims else np.nan
     relevance = sim(row['revealed_text'], row['gt_text'])
     detail_rows.append({
       'run': row['run'],
       'sample_index': row['sample_index'],
+      'snapshot_source': row.get('snapshot_source', 'reveal_fraction'),
       'target_reveal_fraction': row['target_reveal_fraction'],
+      'target_step_fraction': row.get('target_step_fraction', np.nan),
       'step_index': row['step_index'],
       'revealed_fraction': row['revealed_fraction'],
       'coherence': coherence,
@@ -521,13 +702,15 @@ def compute_diag1(
 
   detail_df = pd.DataFrame(detail_rows)
   summary_df = detail_df.groupby(
-    ['run', 'target_reveal_fraction'], as_index=False).agg(
+    ['run', 'snapshot_source', 'target_reveal_fraction'], as_index=False).agg(
+      target_step_fraction=('target_step_fraction', 'mean'),
       coherence=('coherence', 'mean'),
       relevance_to_gt=('relevance_to_gt', 'mean'),
       num_samples=('sample_index', 'count'))
   return detail_df, summary_df, {
     'requested_backend': diag1_backend,
     'actual_backend': backend_name,
+    'coherence_mode': diag1_coherence_mode,
     'notes': backend_notes,
   }
 
@@ -580,9 +763,12 @@ def compute_diag2(
   timing_mode='global_step',
   diag2_backend='auto',
   nltk_data_dir=None,
+  spacy_model='en_core_web_sm',
 ):
   actual_backend, backend_notes = _resolve_diag2_backend(
-    diag2_backend, nltk_data_dir=nltk_data_dir)
+    diag2_backend,
+    nltk_data_dir=nltk_data_dir,
+    spacy_model=spacy_model)
   bucket_rows = []
   overall_rows = []
 
@@ -595,29 +781,43 @@ def compute_diag2(
       max_len = analysis_length(record, analysis_mode)
       if timing_mode == 'reveal_rank':
         timed_tokens = [
-          (item['step'], item['rank_fraction'], item['token_text'])
+          (
+            item['step'],
+            item['rank_fraction'],
+            item['token_text'],
+            item['position'],
+          )
           for item in _ranked_reveals(record, max_len)
         ]
       else:
         step_list = record.get('first_unmask_step', [])[:max_len]
         step_frac_list = record.get('first_unmask_step_fraction', [])[:max_len]
         token_text_list = record.get('first_unmask_token_text', [])[:max_len]
-        timed_tokens = zip(step_list, step_frac_list, token_text_list)
+        timed_tokens = [
+          (step, step_frac, token_text, answer_pos)
+          for answer_pos, (step, step_frac, token_text) in enumerate(zip(
+            step_list, step_frac_list, token_text_list))
+        ]
 
       token_categories = _categorize_positions(
         record.get('first_unmask_token_text', [])[:max_len],
         backend=actual_backend,
         nltk_data_dir=nltk_data_dir,
+        spacy_model=spacy_model,
       )
 
-      for pos_idx, (step, step_frac, token_text) in enumerate(timed_tokens):
+      for step, step_frac, token_text, answer_pos in timed_tokens:
         if step is None or int(step) < 0:
           continue
         step_fraction = float(step_frac) if step_frac is not None else np.nan
         bucket = bucket_from_fraction(step_fraction)
         if bucket is None:
           continue
-        category = token_categories[pos_idx] if pos_idx < len(token_categories) else 'OTHER'
+        category = (
+          token_categories[answer_pos]
+          if answer_pos < len(token_categories)
+          else 'OTHER'
+        )
         counts[bucket][category] += 1
         if category == 'CONTENT':
           content_steps.append(step_fraction)
@@ -656,6 +856,7 @@ def compute_diag2(
   return pd.DataFrame(bucket_rows), pd.DataFrame(overall_rows), {
     'requested_backend': diag2_backend,
     'actual_backend': actual_backend,
+    'spacy_model': spacy_model if actual_backend == 'spacy_pos' else None,
     'notes': backend_notes,
   }
 
@@ -720,12 +921,19 @@ def compute_diag3(runs, analysis_mode, timing_mode='global_step'):
         'sample_index': int(record.get('global_sample_index', len(sample_rows))),
         'early_token_count': len(early_tokens),
         'gt_token_count': len(gt_tokens),
+        'early_committed_fraction': (
+          len(early_tokens) / max_len if max_len else np.nan),
         'survival_to_gt': survival,
       })
 
     summary_rows.append({
       'run': run['label'],
       'mean_survival_to_gt': float(np.mean(run_survivals)) if run_survivals else np.nan,
+      'mean_early_committed_fraction': float(np.nanmean([
+        row['early_committed_fraction']
+        for row in sample_rows
+        if row['run'] == run['label']
+      ])) if any(row['run'] == run['label'] for row in sample_rows) else np.nan,
       'num_valid_samples': len(run_survivals),
     })
 
@@ -743,6 +951,7 @@ def main():
     diag1_backend=args.diag1_backend,
     diag1_encoder_model=args.diag1_encoder_model,
     diag1_svd_components=args.diag1_svd_components,
+    diag1_coherence_mode=args.diag1_coherence_mode,
     transformers_cache=args.transformers_cache,
   )
   diag2_bucket_df, diag2_overall_df, diag2_meta = compute_diag2(
@@ -751,6 +960,7 @@ def main():
     timing_mode=args.timing_mode,
     diag2_backend=args.diag2_backend,
     nltk_data_dir=args.nltk_data_dir,
+    spacy_model=args.spacy_model,
   )
   diag3_sample_df, diag3_summary_df = compute_diag3(
     runs, args.analysis_length, timing_mode=args.timing_mode)

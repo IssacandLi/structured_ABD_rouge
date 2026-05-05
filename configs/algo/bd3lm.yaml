@@ -32,5 +32,6 @@ span_loss:
 structured_inference:
   enabled: False          # 设为 True 启用 C-inf
   aggregation: mean       # span confidence 聚合: mean / top_k_mean / max
+  confidence: top1        # token confidence: top1 / margin / neg_entropy
   commitment: mixed       # mixed = span-token 混合; hard = 纯 span 级
   threshold: fixed_ratio  # fixed_ratio / adaptive

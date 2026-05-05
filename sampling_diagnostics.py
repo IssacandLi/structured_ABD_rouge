@@ -1,4 +1,5 @@
 import copy
+import math
 from typing import List, Optional
 
 import torch
@@ -33,11 +34,14 @@ class SamplingDiagnosticsRecorder:
     mask_index: int,
     snapshot_reveal_fractions: List[float],
     early_fraction: float,
+    snapshot_step_fractions: Optional[List[float]] = None,
   ):
     self.tokenizer = tokenizer
     self.mask_index = int(mask_index)
     self.snapshot_reveal_fractions = sorted(
       float(x) for x in snapshot_reveal_fractions)
+    self.snapshot_step_fractions = sorted(
+      float(x) for x in (snapshot_step_fractions or []))
     self.early_fraction = float(early_fraction)
     self.records = []
     self._states = []
@@ -49,6 +53,9 @@ class SamplingDiagnosticsRecorder:
       if token_id is None:
         pieces.append(None)
       else:
+        if int(token_id) == self.mask_index:
+          pieces.append('[MASK]')
+          continue
         pieces.append(self.tokenizer.decode(
           [int(token_id)],
           skip_special_tokens=False,
@@ -101,6 +108,7 @@ class SamplingDiagnosticsRecorder:
         'gt_answer_length': int(len(gt_answer_token_ids)),
         'total_sampling_steps': int(self.total_sampling_steps),
         'snapshot_reveal_fractions': list(self.snapshot_reveal_fractions),
+        'snapshot_step_fractions': list(self.snapshot_step_fractions),
         'early_fraction': float(self.early_fraction),
         'prefix_token_ids': prefix_token_ids,
         'prefix_token_text': self._decode_pieces(prefix_token_ids),
@@ -109,6 +117,7 @@ class SamplingDiagnosticsRecorder:
         'gt_answer_token_text': self._decode_pieces(gt_answer_token_ids),
         'gt_text': self._decode_text(gt_answer_token_ids),
         'snapshots': [],
+        'step_snapshots': [],
       }
 
       prev_revealed = torch.zeros(len(answer_pos_list), dtype=torch.bool)
@@ -123,9 +132,37 @@ class SamplingDiagnosticsRecorder:
         'first_unmask_t': [None] * len(answer_pos_list),
         'first_unmask_token_ids': [None] * len(answer_pos_list),
         'captured_targets': set(),
+        'captured_step_targets': set(),
       }
       self.records.append(record)
       self._states.append(state)
+
+  def _build_step_snapshot(
+    self,
+    current_answer: torch.Tensor,
+    target_fraction: float,
+    step_index: int,
+    t_value,
+    revealed_fraction: float,
+  ):
+    current_ids = [int(token_id.item()) for token_id in current_answer]
+    visible_positions = torch.where(current_answer != self.mask_index)[0].tolist()
+    visible_token_ids = [
+      int(current_answer[idx].item()) for idx in visible_positions]
+    return {
+      'captured': True,
+      'target_step_fraction': float(target_fraction),
+      'step_index': int(step_index),
+      'step_fraction': float(step_index / self.total_sampling_steps),
+      't': _to_float(t_value),
+      'revealed_fraction': float(revealed_fraction),
+      'answer_token_ids': current_ids,
+      'answer_token_text': self._decode_pieces(current_ids),
+      'visible_positions': visible_positions,
+      'visible_token_ids': visible_token_ids,
+      'visible_token_text': self._decode_pieces(visible_token_ids),
+      'partial_text': self._decode_text(visible_token_ids),
+    }
 
   def record_step(self, x_current: torch.Tensor, step_index: int, t_value=None):
     x_cpu = x_current.detach().cpu()
@@ -157,6 +194,22 @@ class SamplingDiagnosticsRecorder:
       revealed_rel_positions = torch.where(current_revealed)[0].tolist()
       revealed_token_ids = [
         int(current_answer[idx].item()) for idx in revealed_rel_positions]
+      step_fraction = float(step_index / self.total_sampling_steps)
+
+      for target_fraction in self.snapshot_step_fractions:
+        if target_fraction in state['captured_step_targets']:
+          continue
+        if step_fraction + 1e-8 < target_fraction:
+          continue
+        record['step_snapshots'].append(
+          self._build_step_snapshot(
+            current_answer=current_answer,
+            target_fraction=target_fraction,
+            step_index=step_index,
+            t_value=t_value,
+            revealed_fraction=revealed_fraction,
+          ))
+        state['captured_step_targets'].add(target_fraction)
 
       for target_fraction in self.snapshot_reveal_fractions:
         if target_fraction in state['captured_targets']:
@@ -168,7 +221,7 @@ class SamplingDiagnosticsRecorder:
           'captured': True,
           'target_reveal_fraction': float(target_fraction),
           'step_index': int(step_index),
-          'step_fraction': float(step_index / self.total_sampling_steps),
+          'step_fraction': step_fraction,
           't': _to_float(t_value),
           'revealed_fraction': revealed_fraction,
           'revealed_positions': revealed_rel_positions,
@@ -213,6 +266,34 @@ class SamplingDiagnosticsRecorder:
       record['first_unmask_t'] = list(state['first_unmask_t'])
       record['first_unmask_token_ids'] = first_unmask_token_ids
       record['first_unmask_token_text'] = first_unmask_token_text
+      record['first_reveal_step'] = first_unmask_step
+      record['first_reveal_step_fraction'] = first_unmask_step_fraction
+      record['first_reveal_token_ids'] = first_unmask_token_ids
+      record['first_reveal_token_text'] = first_unmask_token_text
+      early_cutoff = int(math.ceil(self.early_fraction * self.total_sampling_steps))
+      early_count = sum(
+        1 for step in first_unmask_step if step is not None and 0 <= step <= early_cutoff)
+      record['early_committed_fraction'] = (
+        float(early_count / len(first_unmask_step))
+        if first_unmask_step else 0.0)
+
+      for target_fraction in self.snapshot_step_fractions:
+        if target_fraction in state['captured_step_targets']:
+          continue
+        record['step_snapshots'].append({
+          'captured': False,
+          'target_step_fraction': float(target_fraction),
+          'step_index': None,
+          'step_fraction': None,
+          't': None,
+          'revealed_fraction': None,
+          'answer_token_ids': [],
+          'answer_token_text': [],
+          'visible_positions': [],
+          'visible_token_ids': [],
+          'visible_token_text': [],
+          'partial_text': '',
+        })
 
       for target_fraction in self.snapshot_reveal_fractions:
         if target_fraction in state['captured_targets']:
@@ -232,6 +313,8 @@ class SamplingDiagnosticsRecorder:
 
       record['snapshots'].sort(
         key=lambda item: item['target_reveal_fraction'])
+      record['step_snapshots'].sort(
+        key=lambda item: item['target_step_fraction'])
 
   def get_records(self):
     return copy.deepcopy(self.records)

@@ -1,0 +1,29 @@
+train: writing_prompts
+valid: writing_prompts
+tokenizer_name_or_path: gpt2
+cache_dir: /data/lab/yan/peihong_li/data_cache/ndp_pilot
+wrap: False
+streaming: False
+
+insert_train_eos: True
+insert_valid_eos: True
+insert_train_special: True
+insert_valid_special: True
+
+# Prompt -> story conditional generation.
+conditional_generation: True
+hf_dataset_name: euclaise/writingprompts
+hf_dataset_config: null
+local_data_dir: null
+local_train_file: train.jsonl
+local_validation_file: validation.jsonl
+prompt_field: prompt
+answer_field: story
+
+# Pilot default: WritingPrompts 1%.
+sample_fraction: 0.01
+max_train_samples: null
+max_valid_samples: null
+prefix_max_tokens: 128
+answer_max_tokens: 893
+loss_on_answer_eos: True
